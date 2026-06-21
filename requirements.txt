@@ -1,0 +1,6 @@
+streamlit
+pandas
+numpy
+jaydebeapi
+JPype1
+openpyxl
