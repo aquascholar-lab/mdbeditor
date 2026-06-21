@@ -3,6 +3,7 @@ import re
 import glob
 import shutil
 import tempfile
+import urllib.request
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -40,15 +41,34 @@ def safe_filename(name):
 
 
 def get_ucanaccess_jars():
+    """
+    Use existing UCanAccess JAR from lib/.
+    If not found, automatically download the UCanAccess uber JAR.
+    """
+
+    os.makedirs("lib", exist_ok=True)
+
     jars = glob.glob("lib/*.jar")
 
-    if len(jars) == 0:
-        st.error(
-            "No UCanAccess JAR files found. Please create a lib folder and place all UCanAccess .jar files inside it."
-        )
+    if len(jars) > 0:
+        return jars
+
+    st.info("UCanAccess JAR not found in lib/. Downloading automatically...")
+
+    ucanaccess_url = (
+        "https://repo1.maven.org/maven2/io/github/spannm/"
+        "ucanaccess/5.1.5/ucanaccess-5.1.5-uber.jar"
+    )
+
+    jar_path = "lib/ucanaccess-5.1.5-uber.jar"
+
+    try:
+        urllib.request.urlretrieve(ucanaccess_url, jar_path)
+    except Exception as e:
+        st.error(f"Could not download UCanAccess JAR: {e}")
         st.stop()
 
-    return jars
+    return [jar_path]
 
 
 def connect_access_db(mdb_path):
@@ -122,8 +142,18 @@ def get_column_info(conn, table_name):
 
 
 def convert_value(v):
+    """
+    Convert pandas/numpy values into normal Python values
+    before sending to Access database.
+    """
+
     if pd.isna(v):
         return None
+
+    if isinstance(v, str):
+        if v.strip() == "":
+            return None
+        return v
 
     if isinstance(v, np.integer):
         return int(v)
@@ -134,68 +164,172 @@ def convert_value(v):
     if isinstance(v, np.bool_):
         return bool(v)
 
+    if isinstance(v, pd.Timestamp):
+        return v.to_pydatetime()
+
     return v
 
 
-def update_table_by_key(conn, table_name, edited_df, original_df, key_col):
+def is_blank(v):
+    if pd.isna(v):
+        return True
+
+    if isinstance(v, str) and v.strip() == "":
+        return True
+
+    return False
+
+
+def values_are_different(a, b):
+    if pd.isna(a) and pd.isna(b):
+        return False
+
+    if is_blank(a) and is_blank(b):
+        return False
+
+    return str(a) != str(b)
+
+
+def save_table_changes_allow_new_rows(conn, table_name, edited_df, original_df, key_col):
     """
-    Updates existing rows only.
-    Does not add or delete rows.
+    Update existing rows and insert newly added rows.
+
+    Existing rows:
+        Identified using key_col.
+
+    New rows:
+        Rows whose key_col value is blank or not present in original_df.
+
+    Deleted rows:
+        Ignored safely. This function does not delete rows from MDB.
     """
 
     if key_col not in edited_df.columns:
         raise ValueError("Selected key column not found in edited table.")
 
-    if len(edited_df) != len(original_df):
-        raise ValueError(
-            "Row count changed. For safe MDB editing, do not add/delete rows. Edit values only."
-        )
-
     cur = conn.cursor()
 
-    update_cols = [c for c in edited_df.columns if c != key_col]
+    original_keys = set(
+        original_df[key_col]
+        .dropna()
+        .astype(str)
+        .tolist()
+    )
+
+    editable_columns = list(edited_df.columns)
 
     updated_rows = 0
+    inserted_rows = 0
+    skipped_blank_rows = 0
 
-    for i in range(len(edited_df)):
-        edited_row = edited_df.iloc[i]
-        original_row = original_df.iloc[i]
+    for _, edited_row in edited_df.iterrows():
 
-        # Skip rows that are unchanged
-        changed = False
-        for col in update_cols:
-            ev = edited_row[col]
-            ov = original_row[col]
+        key_value = edited_row[key_col]
 
-            if pd.isna(ev) and pd.isna(ov):
-                continue
-
-            if str(ev) != str(ov):
-                changed = True
+        # Ignore completely blank new rows from the Streamlit editor
+        row_has_any_value = False
+        for col in editable_columns:
+            if not is_blank(edited_row[col]):
+                row_has_any_value = True
                 break
 
-        if not changed:
+        if not row_has_any_value:
+            skipped_blank_rows += 1
             continue
 
-        set_clause = ", ".join([f"{quote_access_name(c)} = ?" for c in update_cols])
-
-        sql = (
-            f"UPDATE {quote_access_name(table_name)} "
-            f"SET {set_clause} "
-            f"WHERE {quote_access_name(key_col)} = ?"
+        is_new_row = (
+            is_blank(key_value)
+            or str(key_value) not in original_keys
         )
 
-        params = [convert_value(edited_row[c]) for c in update_cols]
-        params.append(convert_value(edited_row[key_col]))
+        # ----------------------------------------------------
+        # INSERT NEW ROW
+        # ----------------------------------------------------
+        if is_new_row:
 
-        cur.execute(sql, params)
+            insert_cols = []
+            insert_vals = []
 
-        updated_rows += 1
+            for col in editable_columns:
+
+                val = edited_row[col]
+
+                # If key is blank, skip it.
+                # This is useful for AutoNumber fields.
+                if col == key_col and is_blank(val):
+                    continue
+
+                # Skip blank cells during insert.
+                # Access will apply default/null where allowed.
+                if is_blank(val):
+                    continue
+
+                insert_cols.append(col)
+                insert_vals.append(convert_value(val))
+
+            if len(insert_cols) == 0:
+                skipped_blank_rows += 1
+                continue
+
+            col_clause = ", ".join([quote_access_name(c) for c in insert_cols])
+            placeholders = ", ".join(["?"] * len(insert_cols))
+
+            sql = (
+                f"INSERT INTO {quote_access_name(table_name)} "
+                f"({col_clause}) VALUES ({placeholders})"
+            )
+
+            cur.execute(sql, insert_vals)
+            inserted_rows += 1
+
+        # ----------------------------------------------------
+        # UPDATE EXISTING ROW
+        # ----------------------------------------------------
+        else:
+
+            matching_original = original_df[
+                original_df[key_col].astype(str) == str(key_value)
+            ]
+
+            if matching_original.empty:
+                continue
+
+            original_row = matching_original.iloc[0]
+
+            update_cols = [c for c in editable_columns if c != key_col]
+
+            changed_cols = []
+
+            for col in update_cols:
+                edited_val = edited_row[col]
+                original_val = original_row[col]
+
+                if values_are_different(edited_val, original_val):
+                    changed_cols.append(col)
+
+            if len(changed_cols) == 0:
+                continue
+
+            set_clause = ", ".join([
+                f"{quote_access_name(c)} = ?" for c in changed_cols
+            ])
+
+            sql = (
+                f"UPDATE {quote_access_name(table_name)} "
+                f"SET {set_clause} "
+                f"WHERE {quote_access_name(key_col)} = ?"
+            )
+
+            params = [convert_value(edited_row[c]) for c in changed_cols]
+            params.append(convert_value(key_value))
+
+            cur.execute(sql, params)
+            updated_rows += 1
 
     conn.commit()
     cur.close()
 
-    return updated_rows
+    return updated_rows, inserted_rows, skipped_blank_rows
 
 
 # ------------------------------------------------------------
@@ -224,11 +358,21 @@ workdir = st.session_state.workdir
 original_path = os.path.join(workdir, safe_filename(uploaded_mdb.name))
 edited_path = os.path.join(workdir, "SWAT2012_edited.mdb")
 
-with open(original_path, "wb") as f:
-    f.write(uploaded_mdb.getbuffer())
+# Save uploaded file only once per upload session
+uploaded_signature = f"{uploaded_mdb.name}_{uploaded_mdb.size}"
 
-# Work only on a copy
-shutil.copy(original_path, edited_path)
+if st.session_state.get("uploaded_signature") != uploaded_signature:
+    st.session_state["uploaded_signature"] = uploaded_signature
+
+    with open(original_path, "wb") as f:
+        f.write(uploaded_mdb.getbuffer())
+
+    # Work only on a copy
+    shutil.copy(original_path, edited_path)
+
+    # Clear previous table state when new MDB is uploaded
+    if "saved_message" in st.session_state:
+        del st.session_state["saved_message"]
 
 
 # ------------------------------------------------------------
@@ -268,7 +412,7 @@ with col1:
     max_rows = st.number_input(
         "Rows to load for editing",
         min_value=10,
-        max_value=100000,
+        max_value=500000,
         value=1000,
         step=100
     )
@@ -295,6 +439,12 @@ with st.expander("Column information"):
 
 st.write(f"Loaded rows: **{len(df)}** | Columns: **{len(df.columns)}**")
 
+st.info(
+    "You can now add new rows at the bottom of the table. "
+    "For AutoNumber key fields, keep the key value blank in the new row. "
+    "Deleted rows are ignored and will not be deleted from the MDB."
+)
+
 
 # ------------------------------------------------------------
 # Key column selection
@@ -304,12 +454,18 @@ possible_keys = list(df.columns)
 
 preferred_keys = [
     "OBJECTID",
+    "ObjectID",
+    "objectid",
     "ID",
+    "Id",
+    "id",
     "OID",
     "Name",
     "NAME",
+    "name",
     "Station",
-    "STATION"
+    "STATION",
+    "station"
 ]
 
 default_key_index = 0
@@ -323,7 +479,10 @@ key_col = st.selectbox(
     "Select key column for safe row updates",
     options=possible_keys,
     index=default_key_index,
-    help="This column is used in the WHERE clause during update. Prefer OBJECTID or ID if available."
+    help=(
+        "This column is used to identify existing rows during update. "
+        "For AutoNumber fields, keep this key blank in newly added rows."
+    )
 )
 
 
@@ -336,8 +495,8 @@ st.subheader("✏️ Edit table online")
 edited_df = st.data_editor(
     df,
     use_container_width=True,
-    num_rows="fixed",
-    height=500
+    num_rows="dynamic",
+    height=550
 )
 
 
@@ -376,7 +535,7 @@ with c3:
 
 if save_button:
     try:
-        updated_count = update_table_by_key(
+        updated_count, inserted_count, skipped_blank_rows = save_table_changes_allow_new_rows(
             conn=conn,
             table_name=table_name,
             edited_df=edited_df,
@@ -384,10 +543,21 @@ if save_button:
             key_col=key_col
         )
 
-        st.success(f"Saved changes successfully. Updated rows: {updated_count}")
+        st.session_state["saved_message"] = (
+            f"Saved changes successfully. "
+            f"Updated rows: {updated_count}; "
+            f"Inserted new rows: {inserted_count}; "
+            f"Skipped blank rows: {skipped_blank_rows}."
+        )
+
+        st.success(st.session_state["saved_message"])
 
     except Exception as e:
         st.error(f"Could not save changes: {e}")
+
+
+if "saved_message" in st.session_state:
+    st.success(st.session_state["saved_message"])
 
 
 # ------------------------------------------------------------
